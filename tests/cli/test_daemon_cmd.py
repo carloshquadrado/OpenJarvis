@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import secrets
 import subprocess
 import sys
 import time
@@ -18,6 +19,7 @@ from openjarvis.cli.daemon_cmd import (
     _read_pid,
     _write_pid,
 )
+from openjarvis.core.utils import terminate_process
 
 
 class TestDaemonCommands:
@@ -290,3 +292,81 @@ class TestDaemonDetachment:
         kwargs = self._spawn_kwargs("linux")
         assert kwargs.get("start_new_session") is True
         assert "creationflags" not in kwargs or kwargs["creationflags"] == 0
+
+
+def test_subprocess_registers_actual_python_pid(tmp_path: Path, monkeypatch) -> None:
+    """A real child registers its PID whether Python is direct or uses a launcher."""
+    from openjarvis.cli import daemon_cmd
+
+    pid_file = tmp_path / "server.pid"
+    state_file = tmp_path / "server.json"
+    child_pid_file = tmp_path / "child.pid"
+    ready_file = tmp_path / "child.ready"
+    log_file = tmp_path / "child.log"
+    token = secrets.token_hex(16)
+    monkeypatch.setattr(daemon_cmd, "_PID_FILE", pid_file)
+    monkeypatch.setattr(daemon_cmd, "_STATE_FILE", state_file)
+
+    code = """
+import os
+import time
+from pathlib import Path
+from openjarvis.cli import daemon_cmd
+
+daemon_cmd._PID_FILE = Path(os.environ["OJ_TEST_PID_FILE"])
+daemon_cmd._STATE_FILE = Path(os.environ["OJ_TEST_STATE_FILE"])
+pid_file = Path(os.environ["OJ_TEST_CHILD_PID_FILE"])
+pid_tmp = pid_file.with_suffix(".tmp")
+pid_tmp.write_text(str(os.getpid()))
+pid_tmp.replace(pid_file)
+try:
+    daemon_cmd.record_server_state(os.getpid(), "127.0.0.1", 8899)
+    Path(os.environ["OJ_TEST_READY_FILE"]).write_text("ready")
+    time.sleep(30)
+finally:
+    daemon_cmd.clear_server_state(os.getpid())
+"""
+    env = {
+        **os.environ,
+        daemon_cmd._LAUNCH_TOKEN_ENV: token,
+        "OJ_TEST_PID_FILE": str(pid_file),
+        "OJ_TEST_STATE_FILE": str(state_file),
+        "OJ_TEST_CHILD_PID_FILE": str(child_pid_file),
+        "OJ_TEST_READY_FILE": str(ready_file),
+    }
+    with log_file.open("w") as log_fh:
+        proc = subprocess.Popen(
+            [sys.executable, "-c", code],
+            stdout=log_fh,
+            stderr=log_fh,
+            env=env,
+        )
+
+    actual_pid = None
+    try:
+        daemon_cmd._write_pid(proc.pid, "127.0.0.1", 0, ready=False, launch_token=token)
+        deadline = time.monotonic() + 15.0
+        while time.monotonic() < deadline:
+            if child_pid_file.exists():
+                actual_pid = int(child_pid_file.read_text())
+            if ready_file.exists():
+                break
+            time.sleep(0.05)
+
+        assert ready_file.exists(), log_file.read_text()
+        assert actual_pid is not None
+        assert daemon_cmd._read_pid_file() == actual_pid
+        assert daemon_cmd._read_state()["pid"] == actual_pid
+        assert daemon_cmd._read_state()["port"] == 8899
+        assert daemon_cmd._read_state().get("ready", True)
+    finally:
+        terminate_process(proc.pid, grace_seconds=2.0)
+        if actual_pid is None and child_pid_file.exists():
+            actual_pid = int(child_pid_file.read_text())
+        if actual_pid is not None and actual_pid != proc.pid:
+            terminate_process(actual_pid, grace_seconds=2.0)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
