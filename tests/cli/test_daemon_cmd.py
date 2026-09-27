@@ -6,15 +6,14 @@ import os
 import subprocess
 import sys
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-import pytest
 from click.testing import CliRunner
 
 from openjarvis.cli import cli
 from openjarvis.cli.daemon_cmd import (
-    _pending_server_pid,
     _pid_alive,
     _read_pid,
     _write_pid,
@@ -157,12 +156,12 @@ class TestDaemonDetachment:
         """
         with (
             patch("openjarvis.cli.daemon_cmd._read_pid", return_value=None),
-            patch("openjarvis.cli.daemon_cmd._write_pid"),
+            patch("openjarvis.cli.daemon_cmd._read_pid_unlocked", return_value=None),
+            patch("openjarvis.cli.daemon_cmd._state_lock", return_value=nullcontext()),
+            patch("openjarvis.cli.daemon_cmd._write_pid_unlocked"),
             patch("openjarvis.cli.daemon_cmd.load_config"),
             patch("openjarvis.cli.daemon_cmd.sys.platform", platform),
-            patch(
-                "openjarvis.cli.daemon_cmd._windows_child_process", return_value=4321
-            ),
+            patch("openjarvis.cli.daemon_cmd.DEFAULT_CONFIG_DIR"),
             patch("openjarvis.cli.daemon_cmd.subprocess.Popen") as popen,
             patch("builtins.open", MagicMock()),
         ):
@@ -175,118 +174,80 @@ class TestDaemonDetachment:
             assert spawns, f"start did not spawn the server: {popen.call_args_list}"
             return spawns[-1].kwargs
 
-    def test_windows_uv_launcher_uses_different_child_pid(self) -> None:
-        """Windows uv launcher can report a different PID from its child."""
-        if sys.platform != "win32":
-            pytest.skip("Windows-specific process behavior")
-
-        code = """
-import os
-import time
-
-print(f"{os.getpid()} {os.getppid()}", flush=True)
-time.sleep(5)
-"""
-
-        proc = subprocess.Popen(
-            [sys.executable, "-c", code],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-
-        try:
-            child_pid, parent_pid = map(int, proc.stdout.readline().split())
-
-            assert proc.pid != child_pid
-            assert parent_pid == proc.pid
-        finally:
-            proc.terminate()
-            proc.wait()
-
-    def test_windows_pending_registration_uses_child_pid(self) -> None:
-        """Windows pending registration must use the real child PID."""
-        if sys.platform != "win32":
-            pytest.skip("Windows-specific process behavior")
-
-        code = """
-import time
-
-time.sleep(5)
-"""
-
-        proc = subprocess.Popen(
-            [sys.executable, "-c", code],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-
-        try:
-            pending_pid = _pending_server_pid(proc.pid)
-
-            assert pending_pid != proc.pid
-
-            assert _pid_alive(pending_pid)
-        finally:
-            proc.terminate()
-            proc.wait()
-
-    def test_windows_start_registers_real_server_pid(self) -> None:
-        """Windows start must register the Python child PID, not its launcher."""
+    def test_windows_start_registers_spawned_pid_immediately(
+        self, tmp_path: Path
+    ) -> None:
+        """Both direct Python and launchers can protect the startup interval."""
         with (
             patch("openjarvis.cli.daemon_cmd._read_pid", return_value=None),
+            patch("openjarvis.cli.daemon_cmd._read_pid_unlocked", return_value=None),
+            patch("openjarvis.cli.daemon_cmd._state_lock", return_value=nullcontext()),
             patch("openjarvis.cli.daemon_cmd.load_config"),
             patch("openjarvis.cli.daemon_cmd.subprocess.Popen") as popen,
-            patch("builtins.open", MagicMock()),
-            patch(
-                "openjarvis.cli.daemon_cmd._windows_child_process", return_value=9876
-            ),
+            patch("openjarvis.cli.daemon_cmd.DEFAULT_CONFIG_DIR", tmp_path),
+            patch("openjarvis.cli.daemon_cmd._LOG_FILE", tmp_path / "server.log"),
             patch("openjarvis.cli.daemon_cmd.sys.platform", "win32"),
-            patch("openjarvis.cli.daemon_cmd._write_pid") as write_pid,
+            patch("openjarvis.cli.daemon_cmd._write_pid_unlocked") as write_pid,
+            patch.object(subprocess, "DETACHED_PROCESS", 0x00000008, create=True),
+            patch.object(
+                subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200, create=True
+            ),
         ):
             popen.return_value = MagicMock(pid=4321)
 
             result = CliRunner().invoke(cli, ["start"])
 
             assert result.exit_code == 0, result.output
+            assert "launch PID 4321" in result.output
             write_pid.assert_called_once()
-            assert write_pid.call_args.args[0] == 9876
+            assert write_pid.call_args.args[0] == 4321
             assert write_pid.call_args.kwargs["ready"] is False
+            token = write_pid.call_args.kwargs["launch_token"]
+            assert token
+            assert (
+                popen.call_args.kwargs["env"]["OPENJARVIS_DAEMON_LAUNCH_TOKEN"] == token
+            )
 
-    def test_windows_pending_pid_waits_for_child(self) -> None:
-        """Windows start waits briefly for the Python child process."""
+    def test_second_start_rechecks_under_lock(self, tmp_path: Path) -> None:
+        """A second start must not spawn after another caller registered."""
         with (
-            patch("openjarvis.cli.daemon_cmd._windows_child_process") as child_process,
-            patch("openjarvis.cli.daemon_cmd.sys.platform", "win32"),
-            patch("openjarvis.cli.daemon_cmd.time.sleep") as sleep,
+            patch("openjarvis.cli.daemon_cmd._read_pid", return_value=None),
+            patch("openjarvis.cli.daemon_cmd._read_pid_unlocked", return_value=4321),
+            patch("openjarvis.cli.daemon_cmd._state_lock", return_value=nullcontext()),
+            patch("openjarvis.cli.daemon_cmd.load_config"),
+            patch("openjarvis.cli.daemon_cmd.DEFAULT_CONFIG_DIR", tmp_path),
+            patch("openjarvis.cli.daemon_cmd.subprocess.Popen") as popen,
         ):
-            child_process.side_effect = [None, None, 9876]
+            result = CliRunner().invoke(cli, ["start"])
+            assert result.exit_code != 0
+            assert "already running" in result.output
+            popen.assert_not_called()
 
-            result = _pending_server_pid(4321)
-
-            assert result == 9876
-            assert child_process.call_count == 3
-            assert sleep.call_count == 2
-
-    def test_windows_pending_pid_fails_if_child_never_appears(self) -> None:
-        """Windows start fails if the Python child process never appears."""
+    def test_failed_registration_terminates_spawned_tree(self, tmp_path: Path) -> None:
+        """A failed launch must clean up its launcher and any descendants."""
         with (
+            patch("openjarvis.cli.daemon_cmd._read_pid", return_value=None),
+            patch("openjarvis.cli.daemon_cmd._read_pid_unlocked", return_value=None),
+            patch("openjarvis.cli.daemon_cmd._state_lock", return_value=nullcontext()),
+            patch("openjarvis.cli.daemon_cmd.load_config"),
+            patch("openjarvis.cli.daemon_cmd.DEFAULT_CONFIG_DIR", tmp_path),
+            patch("openjarvis.cli.daemon_cmd._LOG_FILE", tmp_path / "server.log"),
             patch(
-                "openjarvis.cli.daemon_cmd._windows_child_process", return_value=None
+                "openjarvis.cli.daemon_cmd._write_pid_unlocked",
+                side_effect=RuntimeError("conflict"),
             ),
-            patch("openjarvis.cli.daemon_cmd.sys.platform", "win32"),
-            patch("openjarvis.cli.daemon_cmd.time.sleep"),
             patch(
-                "openjarvis.cli.daemon_cmd.time.monotonic",
-                side_effect=[0.0, 2.0],
+                "openjarvis.cli.daemon_cmd.subprocess.Popen",
+                return_value=MagicMock(pid=4321),
             ),
+            patch("openjarvis.cli.daemon_cmd.terminate_process") as terminate,
+            patch("openjarvis.cli.daemon_cmd.clear_server_state") as clear,
         ):
-            with pytest.raises(
-                RuntimeError,
-                match="Unable to determine the Windows server process PID",
-            ):
-                _pending_server_pid(4321)
+            result = CliRunner().invoke(cli, ["start"])
+            assert result.exit_code != 0
+            assert "conflict" in result.output
+            terminate.assert_called_once_with(4321, grace_seconds=10.0)
+            clear.assert_called_once_with(4321)
 
     def test_windows_spawn_is_detached_from_the_console(self) -> None:
         # These constants are only exported by ``subprocess`` on Windows.
