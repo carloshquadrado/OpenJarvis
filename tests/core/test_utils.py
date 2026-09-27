@@ -142,6 +142,7 @@ class TestTerminateProcess:
     def test_terminate_none_no_crash(self) -> None:
         terminate_process(None)
 
+    @pytest.mark.skipif(platform.system() == "Windows", reason="POSIX-only")
     def test_posix_escalates_to_sigkill(self) -> None:
         with (
             patch("openjarvis.core.utils.platform.system", return_value="Linux"),
